@@ -1,0 +1,49 @@
+model:
+  class_name: erayzer_core.model.erayzer.ERayZer
+  geometry_output: gaussians
+  depth_output:
+    eps: 1.0e-4
+  gaussians:
+    n_gaussians: 1
+    range_setting:
+      far: 8
+      near: 0
+      type: linear_depth
+    sh_degree: 3
+    upsampler:
+      upsample_factor: 1
+  gs_per_pixel_sqrt: 1
+  hard_pixelalign: true
+  image_tokenizer:
+    image_size: 256
+    in_channels: 3
+    patch_size: 16
+    use_off_the_shelf: false
+  near_plane: 0.2
+  pose_latent:
+    canonical: middle
+    length: 1
+    mode: pairwise
+  scaling_bias: -3.0
+  scaling_max: -2.0
+  target_image:
+    height: 256
+    width: 256
+  transformer:
+    d: 768
+    d_head: 64
+    decoder_n_layer: 8
+    depth_init: true
+    encoder_geom_n_layer: 16
+    encoder_n_layer: 16
+    fix_decoder: false
+    neck_n_layer: 1
+    special_init: true
+    use_qk_norm: true
+    norm_type: layernorm
+    ln_bias: false
+    use_rope: false
+    rope_mode: 2d_mrpe
+    rope_theta: 10000.0
+  use_deferred_rendering: false
+  use_gsplat: true

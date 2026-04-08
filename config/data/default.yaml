@@ -1,0 +1,25 @@
+training:
+  dataset: dl3dv
+  benchmark_rayzer_txt: null
+  use_val_benchmark_scenes: true
+  val_dataset_length: 1024
+  num_all_views: 10
+  num_views: 10
+  num_input_views: 5
+  num_target_views: 5
+  # temporal_halves | interleaved_even_odd | interleaved_gcd | ends_bridge
+  view_layout: temporal_halves
+  center_crop: true
+  square_crop: true
+  domain_randomization: true
+  random_shuffle: false
+  random_split: true
+  force_first_last_in_input: false
+  view_selector:
+    curriculum_iter: 86000
+    curriculum_start_max_frame_dist: 1.0
+    curriculum_start_min_frame_dist: 1.0
+    max_frame_dist: 0.5
+    min_frame_dist: 1.0
+    type: covisibility
+    use_curriculum: true

@@ -1,0 +1,11 @@
+# Training stack (separate from Gradio inference requirements.txt)
+# Muon hybrid optimizer needs torch.optim.Muon (PyTorch >= 2.11)
+torch>=2.1.0
+torchvision>=0.16.0
+lightning>=2.1.0
+numpy>=1.24.0,<2
+Pillow>=10.0.0
+PyYAML>=6.0.0
+easydict>=1.13
+einops>=0.7.0
+wandb>=0.16.0

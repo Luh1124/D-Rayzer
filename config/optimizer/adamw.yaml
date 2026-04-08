@@ -1,0 +1,15 @@
+training:
+  lr: 0.0004
+  optimizer: adamw
+  weight_decay: 0.05
+  beta1: 0.9
+  beta2: 0.95
+  warmup: 3000
+  muon_lr: null
+  muon_weight_decay: null
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  muon_eps: 1.0e-7
+  muon_adjust_lr_fn: match_rms_adamw
+  freeze_focal_steps: 200

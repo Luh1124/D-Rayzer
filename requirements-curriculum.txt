@@ -1,0 +1,5 @@
+# Optional: DINOv3 semantic overlap preprocessing (scripts/compute_dino_semantic_overlap_profiles.py)
+# Requires PyTorch with CUDA for practical speed (install separately for your platform).
+transformers>=4.51.0
+accelerate>=0.33.0
+safetensors>=0.4.0

@@ -1,0 +1,9 @@
+training:
+  optimizer: muon_hybrid
+  muon_lr: 0.0004
+  muon_weight_decay: 0.05
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  muon_eps: 1.0e-7
+  muon_adjust_lr_fn: match_rms_adamw
