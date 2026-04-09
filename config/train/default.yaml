@@ -1,5 +1,8 @@
+# Paper training (Sec.): 152K steps, global batch 192 (=24/GPU × 8 GPUs), 3K LR warmup to 4e-4,
+# cosine LR to 0, grad clip 1.0, skip optimizer step if ||g||>5 before clip; curriculum linear over 86K steps (CLI --curriculum-ramp-steps).
 training:
-  allowed_gradnorm_factor: 5.0
+  # Pre-clip ||g|| skip (paper: 5.0). null = off (still clip to grad_clip_norm). Large batch often needs null or higher threshold.
+  allowed_gradnorm_factor: null
   num_sanity_val_steps: 2
   skip_heavy_gaussian_export: true
   gs_supervise_target_views_only: true
@@ -12,6 +15,17 @@ training:
   grad_checkpoint_every: 1
   grad_clip_norm: 1.0
   l2_loss_weight: 1.0
+  warmup: 3000
+  # LinearLR initial multiplier vs peak LR (default 1e-4: avoids 1e-8 which plots as ~4e-12 and looks “broken”).
+  lr_warmup_start_factor: 1.0e-4
+  # constant | cosine — paper uses cosine to 0 after warmup (override with lr_schedule: constant for ablations).
+  lr_schedule: cosine
+  lr_cosine_t_max_steps: null
+  lr_cosine_min_ratio: 0.0
+  # Stop when successful optimizer steps reach this (null or --max-effective-updates 0 = only CLI --max-steps).
+  max_effective_updates: 152000
+  # Floor for Trainer.max_steps when max_effective_updates is set: max(cli, cap + slack) so skips do not end train early.
+  max_global_step_slack: 1000000
   max_fwdbwd_passes: 152000
   max_resample_tries: 200
   no_pass_steps: 200

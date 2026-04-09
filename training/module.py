@@ -25,6 +25,43 @@ from erayzer_core.model.reprojection_warp import (
 )
 
 
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    tr: Any,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """
+    Optional cosine decay (``training.lr_schedule: cosine``), with linear warmup using
+    ``training.warmup`` steps when set (same key as in ``config/optimizer/adamw.yaml``).
+    """
+    T_total = tr.get("lr_cosine_t_max_steps")
+    if T_total is None:
+        T_total = int(tr.get("max_fwdbwd_passes", 152_000))
+    T_total = max(1, int(T_total))
+    warmup = int(tr.get("warmup", 0) or 0)
+    warmup = max(0, min(warmup, T_total - 1))
+    min_ratio = float(tr.get("lr_cosine_min_ratio", 0.0))
+    base = float(optimizer.param_groups[0]["lr"])
+    # Paper: cosine decay to zero at end → lr_cosine_min_ratio: 0
+    eta_min = max(0.0, base * min_ratio)
+    T_cosine = max(1, T_total - warmup)
+    # Warmup starts at base * start_factor (default 1e-4 of peak; avoid 1e-8 which looks like "dead" LR on W&B).
+    wstart = float(tr.get("lr_warmup_start_factor", 1e-4))
+    wstart = max(1e-12, wstart)
+
+    cos = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=T_cosine, eta_min=eta_min
+    )
+    if warmup <= 0:
+        return cos
+
+    lin = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=wstart, end_factor=1.0, total_iters=warmup
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer, [lin, cos], milestones=[warmup]
+    )
+
+
 def _ensure_training_edict(cfg: edict) -> None:
     t = cfg.get("training")
     if t is None:
@@ -155,6 +192,12 @@ class ERayZerTrainModule(LightningModule):
         self._manual_optimization = uses_multiple_optimizers(self.erayzer, self.cfg.training)
         self.automatic_optimization = not self._manual_optimization
         self._grad_clip_norm = float(tr.get("grad_clip_norm", 0.0))
+        # When True, grad clip + optional skip (paper) run inside the module; Trainer must not clip again.
+        self._uses_internal_grad_clip = True
+        # Successful optimizer.step() count (paper: LR + curriculum align with effective updates, not skipped batches).
+        self.register_buffer("_effective_update_count", torch.zeros((), dtype=torch.long))
+        # Same scheduler objects as in configure_optimizers (manual opt must step these; lr_schedulers() can be unset early).
+        self._step_lr_schedulers_list: Optional[list] = None
 
     def _autocast(self):
         if not self.use_amp or self.device.type != "cuda":
@@ -163,9 +206,94 @@ class ERayZerTrainModule(LightningModule):
 
     def configure_optimizers(self):
         opts = build_optimizers(self.erayzer, self.cfg.training, self.lr)
+        tr = self.cfg.training
+        mode = str(tr.get("lr_schedule", "constant")).lower().replace("-", "_")
+        if mode in ("cosine", "cosine_annealing"):
+            if isinstance(opts, list):
+                self._step_lr_schedulers_list = [_build_lr_scheduler(o, tr) for o in opts]
+                scheds = [
+                    {"scheduler": s, "interval": "step", "frequency": 1}
+                    for s in self._step_lr_schedulers_list
+                ]
+                return opts, scheds
+            s0 = _build_lr_scheduler(opts, tr)
+            self._step_lr_schedulers_list = [s0]
+            return {
+                "optimizer": opts,
+                "lr_scheduler": {
+                    "scheduler": s0,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
         if isinstance(opts, list):
             return opts, []
         return opts
+
+    def lr_scheduler_step(self, scheduler, metric, *args, **kwargs) -> None:
+        """Manual opt steps schedulers in training_step; auto opt skips LR when grad step was skipped."""
+        if self._manual_optimization:
+            return
+        if getattr(self, "_skip_lr_scheduler", True):
+            return
+        return super().lr_scheduler_step(scheduler, metric, *args, **kwargs)
+
+    def _bump_effective_updates(self) -> None:
+        self._effective_update_count.add_(1)
+
+    def _allowed_gradnorm_threshold(self) -> Optional[float]:
+        """Pre-clip ||g|| gate: skip optimizer step if above this. None disables the gate (clip still applies)."""
+        raw = self.cfg.training.get("allowed_gradnorm_factor", 5.0)
+        if raw is None:
+            return None
+        if isinstance(raw, str) and raw.strip().lower() in ("none", "null", "off", "false"):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _manual_lr_scheduler_step_all(self) -> None:
+        """Lightning does not step LR schedulers for manual optimization; call after successful opt.step()."""
+        schedulers = getattr(self, "_step_lr_schedulers_list", None)
+        if not schedulers:
+            schedulers = self.lr_schedulers()
+            if schedulers is None:
+                return
+            if not isinstance(schedulers, list):
+                schedulers = [schedulers]
+        for sch in schedulers:
+            sch.step()
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure, *args, **kwargs):
+        """AdamW-only path: paper grad-norm gate (skip if > allowed_gradnorm_factor) then clip to grad_clip_norm."""
+        if self._manual_optimization:
+            return
+        self._skip_lr_scheduler = True
+        optimizer_closure()
+        # list(): .parameters() is a one-shot iterator; two clip_grad_norm_ calls would exhaust it.
+        params = list(self.erayzer.parameters())
+        gn = torch.nn.utils.clip_grad_norm_(params, float("inf"))
+        gn_f = float(gn.detach().cpu()) if isinstance(gn, torch.Tensor) else float(gn)
+        thr = self._allowed_gradnorm_threshold()
+        self.log("train/grad_norm_pre_clip", gn_f, prog_bar=False, reduce_fx="mean")
+        if thr is not None and gn_f > thr:
+            optimizer.zero_grad()
+            self.log("train/skip_grad_step", 1.0, prog_bar=False, reduce_fx="mean")
+            self.log("train/optimizer_stepped", 0.0, prog_bar=False, reduce_fx="mean")
+            return
+        if self._grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(params, self._grad_clip_norm)
+        optimizer.step()
+        self._bump_effective_updates()
+        self._skip_lr_scheduler = False
+        self.log("train/optimizer_stepped", 1.0, prog_bar=False, reduce_fx="mean")
+        self.log(
+            "train/effective_updates",
+            float(self._effective_update_count.item()),
+            prog_bar=False,
+            reduce_fx="mean",
+        )
 
     def training_step(self, batch: dict, batch_idx: int) -> Union[torch.Tensor, None]:
         if self._depth_mode:
@@ -185,12 +313,32 @@ class ERayZerTrainModule(LightningModule):
             if not isinstance(opts, list):
                 opts = [opts]
             self.manual_backward(loss)
+            params = list(self.erayzer.parameters())
+            gn = torch.nn.utils.clip_grad_norm_(params, float("inf"))
+            gn_f = float(gn.detach().cpu()) if isinstance(gn, torch.Tensor) else float(gn)
+            thr = self._allowed_gradnorm_threshold()
+            self.log("train/grad_norm_pre_clip", gn_f, prog_bar=False, reduce_fx="mean")
+            if thr is not None and gn_f > thr:
+                for opt in opts:
+                    opt.zero_grad(set_to_none=True)
+                self.log("train/skip_grad_step", 1.0, prog_bar=False, reduce_fx="mean")
+                self.log("train/optimizer_stepped", 0.0, prog_bar=False, reduce_fx="mean")
+                return None
             if self._grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.erayzer.parameters(), self._grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(params, self._grad_clip_norm)
             for opt in opts:
                 opt.step()
+            self._bump_effective_updates()
+            self._manual_lr_scheduler_step_all()
             for opt in opts:
                 opt.zero_grad(set_to_none=True)
+            self.log("train/optimizer_stepped", 1.0, prog_bar=False, reduce_fx="mean")
+            self.log(
+                "train/effective_updates",
+                float(self._effective_update_count.item()),
+                prog_bar=False,
+                reduce_fx="mean",
+            )
             return None
         return loss
 

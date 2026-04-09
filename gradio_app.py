@@ -17,6 +17,10 @@ from huggingface_hub import hf_hub_download
 from app_core.engine import get_engine
 from training.config_loader import default_erayzer_config_paths
 
+# Example (match your training stack + experiment):
+#   python gradio_app.py --ckpt experiments/lightning_logs/.../checkpoints/last.ckpt \\
+#     --config config/optimizer/muon_hybrid.yaml --config config/experiments/inter_rope_rms.yaml
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATHS = tuple(default_erayzer_config_paths(THIS_DIR))
 DEFAULT_OUTPUT_ROOT = os.path.join(THIS_DIR, "outputs")
@@ -382,7 +386,10 @@ def main() -> None:
     parser.add_argument(
         "--ckpt",
         default=DEFAULT_CKPT,
-        help="Checkpoint path or Hugging Face URL (defaults to downloading from qitaoz/E-RayZer)",
+        help=(
+            "Weights path: plain .pt state_dict, Lightning .ckpt (erayzer.*), or Hugging Face URL "
+            "(default: download qitaoz/E-RayZer). Architecture must match merged --config."
+        ),
     )
     parser.add_argument(
         "--device", default=None, help="Default device override"

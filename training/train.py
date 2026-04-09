@@ -12,6 +12,7 @@ DINO curriculum (E-RayZer paper Sec. 3.3, multi-frame batches):
     --use-dino-curriculum \\
     --dino-profile-dir /data/dl3dv_train_h256/dino_overlap_profiles \\
     --curriculum-ramp-steps 86000 --num-views 10
+  (Paper-length run uses ``training.max_effective_updates: 152000``; ``--max-steps`` is raised automatically.)
 
 Preprocess + profiles first:
   python scripts/preprocess_dl3dv_training_pack.py ...
@@ -51,7 +52,7 @@ from lightning.pytorch.loggers import CSVLogger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from training.benchmark_scenes import default_benchmark_path
-from training.callbacks import CurriculumRampCallback
+from training.callbacks import CurriculumRampCallback, EffectiveUpdatesStopCallback
 from training.config_loader import (
     default_erayzer_config_paths,
     load_merged_dict,
@@ -117,7 +118,24 @@ def main() -> None:
     p.add_argument("--o-max", type=float, default=1.0, help="Overlap schedule at s=0 (easy).")
     p.add_argument("--o-min", type=float, default=0.75, help="Overlap schedule at s=1 (harder).")
     p.add_argument("--fallback-delta-t", type=int, default=4, help="Integer stride if profile missing.")
-    p.add_argument("--curriculum-ramp-steps", type=int, default=86_000, help="Steps to ramp s from 0 to 1.")
+    p.add_argument(
+        "--curriculum-ramp-steps",
+        type=int,
+        default=86_000,
+        help="After warmup: steps for linear factor t to go 0→1 before clipping (s = t**ramp_power).",
+    )
+    p.add_argument(
+        "--curriculum-warmup-steps",
+        type=int,
+        default=0,
+        help="Keep curriculum at s=0 (easiest overlap) for this many global steps.",
+    )
+    p.add_argument(
+        "--curriculum-ramp-power",
+        type=float,
+        default=1.0,
+        help="s = t**power on t in [0,1]; use >1 (e.g. 2) to slow early curriculum (stay easier longer).",
+    )
     p.add_argument("--dataset-length", type=int, default=20_000, help="Synthetic dataset length (__len__).")
     p.add_argument("--dataset-seed", type=int, default=0)
     p.add_argument(
@@ -140,7 +158,12 @@ def main() -> None:
     )
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--max-steps", type=int, default=100)
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=152_000,
+        help="Paper: 152K optimizer steps (8×A100, global batch 192 = 24/GPU).",
+    )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument(
         "--config",
@@ -215,6 +238,12 @@ def main() -> None:
         default=None,
         help="Override path for curriculum scene index cache (default: <manifest-list>.erayzer_curriculum_scenes.pkl).",
     )
+    p.add_argument(
+        "--max-effective-updates",
+        type=int,
+        default=None,
+        help="Stop after N successful optimizer steps (overrides yaml). Omit to use training.max_effective_updates; 0 disables.",
+    )
     args = p.parse_args()
 
     try:
@@ -233,6 +262,19 @@ def main() -> None:
     tr_cfg = merged_root.get("training") or {}
 
     cbs = [LearningRateMonitor(logging_interval="step")]
+
+    if args.max_effective_updates is not None:
+        eff_cap = args.max_effective_updates
+    else:
+        eff_cap = tr_cfg.get("max_effective_updates")
+    eff_cap_i = 0
+    if eff_cap is not None and str(eff_cap).strip().lower() not in ("none", "null", ""):
+        try:
+            eff_cap_i = max(0, int(eff_cap))
+        except (TypeError, ValueError):
+            eff_cap_i = 0
+    if eff_cap_i > 0:
+        cbs.append(EffectiveUpdatesStopCallback(eff_cap_i))
     view_layout = (
         args.view_layout
         if args.view_layout is not None
@@ -282,7 +324,12 @@ def main() -> None:
             image_width=img_w,
         )
         cbs.append(
-            CurriculumRampCallback(dm.curriculum_progress, ramp_steps=args.curriculum_ramp_steps)
+            CurriculumRampCallback(
+                dm.curriculum_progress,
+                ramp_steps=args.curriculum_ramp_steps,
+                warmup_steps=args.curriculum_warmup_steps,
+                ramp_power=args.curriculum_ramp_power,
+            )
         )
         log_name = "dl3dv_dino_curriculum"
     else:
@@ -317,8 +364,13 @@ def main() -> None:
     else:
         n_sanity = int(tr_cfg.get("num_sanity_val_steps", 2))
 
+    max_steps_trainer = int(args.max_steps)
+    if eff_cap_i > 0:
+        slack = int(tr_cfg.get("max_global_step_slack", 1_000_000))
+        max_steps_trainer = max(max_steps_trainer, eff_cap_i + slack)
+
     trainer_kw: dict = dict(
-        max_steps=args.max_steps,
+        max_steps=max_steps_trainer,
         accelerator=args.accelerator,
         devices=args.devices,
         logger=logger,
@@ -326,8 +378,12 @@ def main() -> None:
         num_sanity_val_steps=n_sanity,
     )
     gc = float(tr_cfg.get("grad_clip_norm", 0.0))
-    # Trainer gradient clipping is incompatible with Lightning manual optimization (e.g. Muon hybrid).
-    if gc > 0 and getattr(model, "automatic_optimization", True):
+    # ERayZerTrainModule applies clip + optional skip in-module; avoid double-clipping in Trainer.
+    if (
+        gc > 0
+        and getattr(model, "automatic_optimization", True)
+        and not getattr(model, "_uses_internal_grad_clip", False)
+    ):
         trainer_kw["gradient_clip_val"] = gc
     _cuda_ok = args.accelerator in ("gpu", "cuda") or (
         args.accelerator == "auto" and torch.cuda.is_available()

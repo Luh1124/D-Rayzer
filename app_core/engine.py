@@ -41,6 +41,34 @@ def _load_config_paths(paths: Sequence[str]) -> edict:
     return load_merged_edict(list(paths))
 
 
+def _state_dict_for_erayzer(checkpoint: object) -> dict:
+    """
+    Accept raw E-RayZer weights, ``{"model": ...}``, or Lightning ``{"state_dict": ...}``
+    with keys like ``erayzer.*`` / ``module.erayzer.*``.
+    """
+    if isinstance(checkpoint, dict):
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
+            state_dict = checkpoint["model"]
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Unexpected checkpoint type: {type(checkpoint)}")
+
+    out: dict = {}
+    for k, v in state_dict.items():
+        nk = k
+        for prefix in ("module.erayzer.", "erayzer.", "module."):
+            if nk.startswith(prefix):
+                nk = nk[len(prefix) :]
+                break
+        out[nk] = v
+    return out
+
+
 def add_scene_cam(scene, c2w, edge_color, image=None, focal=None, imsize=None, screen_width=0.03):
     OPENGL = np.array([
         [1, 0, 0, 0],
@@ -223,7 +251,7 @@ class ERayZerEngine:
                 T.ToTensor(),
             ]
         )
-        amp_dtype = str(training.get("amp_dtype", "fp16")).lower()
+        amp_dtype = str(training.get("amp_dtype", "bf16")).lower()
         self.amp_dtype = torch.bfloat16 if amp_dtype == "bf16" else torch.float16
         self.amp_enabled = bool(training.get("use_amp", True)) and self.device.type == "cuda"
 
@@ -244,6 +272,8 @@ class ERayZerEngine:
         training.view_selector = edict(training.get("view_selector", {}))
         training.view_selector.type = training.view_selector.get("type", "even_I_B")
         training.view_selector.use_curriculum = False
+        # Training yaml defaults to True for speed; Gradio needs video + full Gaussian export.
+        training.skip_heavy_gaussian_export = False
 
         cfg.inference_view_selector_type = cfg.get("inference_view_selector_type", training.view_selector.type)
 
@@ -252,7 +282,7 @@ class ERayZerEngine:
         ModelClass = __import__(module_name, fromlist=[class_name]).__dict__[class_name]
         model = ModelClass(self.config).to(self.device)
         checkpoint = torch.load(self.ckpt_path, map_location=self.device)
-        state_dict = checkpoint.get("model", checkpoint)
+        state_dict = _state_dict_for_erayzer(checkpoint)
         incompatible = model.load_state_dict(state_dict, strict=False)
         if incompatible.missing_keys:
             print(f"[ERayZerEngine] Missing keys: {len(incompatible.missing_keys)}")
@@ -282,7 +312,14 @@ class ERayZerEngine:
         intrinsics = torch.tensor(
             [[[1.0, 1.0, 0.5, 0.5]] * self.num_views], dtype=torch.float32
         )
-        return {"image": images, "fxfycxcy": intrinsics}
+        batch: Dict[str, object] = {"image": images, "fxfycxcy": intrinsics}
+        # Match training layout (e.g. 5 inputs + 5 targets) so rendering supervises targets only.
+        n_in, n_tgt = self.num_input_views, self.num_target_views
+        v0 = images.shape[1]
+        if n_in > 0 and n_tgt > 0 and n_in + n_tgt == self.num_views and v0 == self.num_views:
+            batch["num_input_views"] = n_in
+            batch["num_target_views"] = n_tgt
+        return batch
 
     def _move_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return {
@@ -330,7 +367,7 @@ class ERayZerEngine:
                 img = self._tensor_to_pil(frame)
                 img.save(os.path.join(run_dir, f"pred_view_{idx:02d}.png"))
 
-        if hasattr(result, "pixelalign_xyz") is not None:
+        if getattr(result, "pixelalign_xyz", None) is not None:
             glb_path = os.path.join(run_dir, "point_cloud.glb")
 
             scene = trimesh.Scene()
